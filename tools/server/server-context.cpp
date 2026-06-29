@@ -2745,20 +2745,14 @@ private:
                                         // from a slot still processing its own prompt this iteration races on
                                         // its not-yet-computed suffix cells and corrupts output.
                                         if (other.state != SLOT_STATE_GENERATING) continue;
-                                        const auto  pmin = llama_memory_seq_pos_min(mem, other.id);
+                                        // NOTE: don't filter on seq_pos_min - seq_cp works on cells directly
+                                        // (pos_in + seq_has); seq_pos bookkeeping may be pruned.
                                         const size_t lcp = other.prompt.tokens.get_common_prefix(input_tokens);
-                                        SLT_INF(slot, "[shared-prefix]   cand slot %d: tokens=%zu pos_min=%d lcp=%zu\n",
-                                                other.id, other.prompt.tokens.size(), (int) pmin, lcp);
-                                        // NOTE: do NOT filter on seq_pos_min here - seq_cp works on the cells
-                                        // directly (pos_in + seq_has), and seq_pos bookkeeping may be pruned.
                                         if (lcp > best && lcp < input_tokens.size()) {
                                             best = lcp;
                                             src  = &other;
                                         }
                                     }
-
-                                    SLT_INF(slot, "[shared-prefix] check: own_n_past=%d best_cross=%zu src=%d slot_tokens=%zu\n",
-                                            (int) n_past, best, src ? src->id : -1, slot.prompt.tokens.size());
 
                                     if (src != nullptr && best > n_past) {
                                         // clear this slot's seq, then share [0,best) from src (zero-copy, same positions)
