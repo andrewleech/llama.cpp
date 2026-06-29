@@ -2640,6 +2640,11 @@ private:
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.n_tokens;
 
+                    // [TAG_SHARED_PREFIX] set when this slot got its prefix via cross-slot seq_cp;
+                    // the shared cells are present, so skip the checkpoint-reset that would otherwise
+                    // force a full re-prefill on this (fresh, checkpoint-less) slot.
+                    bool shared_prefix = false;
+
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.t_start_process_prompt = ggml_time_us();
@@ -2720,6 +2725,68 @@ private:
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+
+                                // [TAG_SHARED_PREFIX] cross-slot zero-copy shared prefix (M1):
+                                // if another resident slot shares a longer prefix with this prompt than
+                                // the slot's own cache, attach those KV cells via seq_cp (metadata-only
+                                // in the unified cache, same positions - no shift) instead of recomputing.
+                                // Targets multi-agent fan-out where N subagents share one system prompt.
+                                // See dev-notes/shared-prefix-design.md.
+                                if (!input_tokens.has_mtmd) {
+                                    auto * mem = llama_get_memory(ctx_tgt);
+
+                                    const server_slot * src = nullptr;
+                                    size_t best = n_past; // only worth it if it beats the slot's own reuse
+                                    for (const auto & other : slots) {
+                                        if (other.id == slot.id) continue;
+                                        if (other.prompt.tokens.size() == 0) continue;
+                                        if (other.prompt.tokens.has_mtmd) continue;
+                                        // only share from a STABLE source (done prompt, generating) - sharing
+                                        // from a slot still processing its own prompt this iteration races on
+                                        // its not-yet-computed suffix cells and corrupts output.
+                                        if (other.state != SLOT_STATE_GENERATING) continue;
+                                        const auto  pmin = llama_memory_seq_pos_min(mem, other.id);
+                                        const size_t lcp = other.prompt.tokens.get_common_prefix(input_tokens);
+                                        SLT_INF(slot, "[shared-prefix]   cand slot %d: tokens=%zu pos_min=%d lcp=%zu\n",
+                                                other.id, other.prompt.tokens.size(), (int) pmin, lcp);
+                                        // NOTE: do NOT filter on seq_pos_min here - seq_cp works on the cells
+                                        // directly (pos_in + seq_has), and seq_pos bookkeeping may be pruned.
+                                        if (lcp > best && lcp < input_tokens.size()) {
+                                            best = lcp;
+                                            src  = &other;
+                                        }
+                                    }
+
+                                    SLT_INF(slot, "[shared-prefix] check: own_n_past=%d best_cross=%zu src=%d slot_tokens=%zu\n",
+                                            (int) n_past, best, src ? src->id : -1, slot.prompt.tokens.size());
+
+                                    if (src != nullptr && best > n_past) {
+                                        // clear this slot's seq, then share [0,best) from src (zero-copy, same positions)
+                                        llama_memory_seq_rm(mem, slot.id, -1, -1);
+                                        llama_memory_seq_cp(mem, src->id, slot.id, 0, (llama_pos) best);
+
+                                        // confirm the share produced cells (rollback only if truly none;
+                                        // seq_pos_min may report >0 even when prefix cells are present)
+                                        if (llama_memory_seq_pos_min(mem, slot.id) != -1) {
+                                            if (ctx_dft) {
+                                                auto * mem_dft = llama_get_memory(ctx_dft.get());
+                                                llama_memory_seq_rm(mem_dft, slot.id, -1, -1);
+                                                llama_memory_seq_cp(mem_dft, src->id, slot.id, 0, (llama_pos) best);
+                                            }
+                                            slot.prompt.tokens = input_tokens.clone();
+                                            slot.prompt.tokens.keep_first(best);
+                                            n_past = best;
+                                            shared_prefix = true;
+                                            SLT_INF(slot, "[shared-prefix] reused %zu tokens from slot %d (zero-copy)\n", best, src->id);
+                                        } else {
+                                            // share didn't take (e.g. SWA) - reset slot, fall through to full prefill
+                                            llama_memory_seq_rm(mem, slot.id, -1, -1);
+                                            slot.prompt.tokens.keep_first(0);
+                                            n_past = 0;
+                                            SLT_WRN(slot, "[shared-prefix] seq_cp no-op (SWA?) for %zu tokens, full prefill\n", best);
+                                        }
+                                    }
+                                }
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
@@ -2854,7 +2921,7 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                if (!shared_prefix && pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -2946,9 +3013,13 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
-                    if (ctx_dft) {
-                        common_context_seq_rm(ctx_dft.get(), slot.id, p0, -1);
+                    // [TAG_SHARED_PREFIX] a freshly shared slot has no cells beyond n_past to remove,
+                    // and partial seq_rm aborts on this model's SWA/hybrid cache - skip the truncate.
+                    if (!shared_prefix) {
+                        common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
+                        if (ctx_dft) {
+                            common_context_seq_rm(ctx_dft.get(), slot.id, p0, -1);
+                        }
                     }
 
                     // If using an alora, there may be uncached tokens that come
