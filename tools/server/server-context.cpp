@@ -2755,7 +2755,10 @@ private:
                                     }
 
                                     if (src != nullptr && best > n_past) {
-                                        // clear this slot's seq, then share [0,best) from src (zero-copy, same positions)
+                                        // full-clear this slot's seq, then share [0,best) from src (zero-copy,
+                                        // same positions). The FULL clear (not a partial rm) is what guarantees
+                                        // the slot then holds exactly [0,best) - the invariant the truncate-skip
+                                        // below ([TAG_SHARED_PREFIX]) relies on.
                                         llama_memory_seq_rm(mem, slot.id, -1, -1);
                                         llama_memory_seq_cp(mem, src->id, slot.id, 0, (llama_pos) best);
 
@@ -3007,8 +3010,11 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    // [TAG_SHARED_PREFIX] a freshly shared slot has no cells beyond n_past to remove,
-                    // and partial seq_rm aborts on this model's SWA/hybrid cache - skip the truncate.
+                    // [TAG_SHARED_PREFIX] INVARIANT: when shared_prefix is set, the attach above did a
+                    // full seq_rm(slot, -1, -1) followed by seq_cp(src, slot, 0, n_past), so this slot
+                    // holds exactly [0, n_past) - there is nothing beyond p0 to truncate. (A partial
+                    // seq_rm [p0, -1) would also abort on this model's SWA/hybrid cache.) So skip it.
+                    // If that attach invariant ever changes, this skip must be revisited.
                     if (!shared_prefix) {
                         common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
                         if (ctx_dft) {
