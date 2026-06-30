@@ -911,6 +911,11 @@ void common_context_seq_rm (llama_context * ctx, llama_seq_id seq_id, llama_pos 
 void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta);
 void common_context_seq_cp (llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
 
+// Hybrid-only: ranged seq_cp on the attention (unified KV) sub-cache ONLY, never the recurrent
+// sub-cache. Returns true if performed (ctx has a plain hybrid memory), false otherwise.
+// Keeps the server at the common_* layer with no internal src/ includes.
+bool common_context_seq_cp_attn_only(llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
+
 //
 // Batch utils
 //

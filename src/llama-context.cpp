@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -3903,6 +3904,23 @@ llama_pos llama_memory_seq_pos_max(
     }
 
     return mem->seq_pos_max(seq_id);
+}
+
+// Hybrid-only: ranged seq_cp on the attention (unified KV) sub-cache ONLY.
+// Returns true if performed (mem is a plain llama_memory_hybrid), false otherwise.
+// On a dense unified cache use llama_memory_seq_cp instead.
+bool llama_memory_seq_cp_attn_only(
+        llama_memory_t mem,
+          llama_seq_id seq_id_src,
+          llama_seq_id seq_id_dst,
+             llama_pos p0,
+             llama_pos p1) {
+    auto * h = dynamic_cast<llama_memory_hybrid *>(mem);
+    if (h == nullptr) {
+        return false;
+    }
+    h->get_mem_attn()->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    return true;
 }
 
 bool llama_memory_can_shift(llama_memory_t mem) {

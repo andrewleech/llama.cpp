@@ -602,6 +602,40 @@ struct server_slot {
         other.shared_prefix_n = (size_t) n;
         shared_prefix_n       = std::max(shared_prefix_n, (size_t) n);
     }
+
+    // [TAG_SHARED_PREFIX] M2: hybrid cache share (e.g. qwen35moe).
+    // Attention cells [0, pos_end) are zero-copy shared (metadata-only unified KV).
+    // The recurrent sub-cache is NOT copied — instead, the donor checkpoint `ckpt`
+    // (captured at pos_end) is restored into `other`'s seq to give an independent,
+    // positionally-correct SSM state with no aliasing of the donor's live tail.
+    // Returns true on success, false if the cast failed (not a plain hybrid, fall back to cold prefill).
+    // Call order guarantees find_slot capacity: seq_rm frees `other`'s prior cells BEFORE load_tgt.
+    bool share_hybrid_prefix_to(server_slot & other, llama_pos pos_end, const common_prompt_checkpoint & ckpt) const {
+        // (1) Free consumer's prior cells in BOTH sub-caches so find_slot has a free recurrent cell.
+        common_context_seq_rm(ctx_tgt, other.id, -1, -1);
+
+        // (2) Zero-copy attention share ONLY — never the recurrent alias.
+        if (!common_context_seq_cp_attn_only(ctx_tgt, id, other.id, 0, pos_end)) {
+            // Cast failed: not a plain hybrid. Leave consumer seq_rm'd; caller must cold-prefill.
+            return false;
+        }
+
+        // (3) Restore recurrent state@boundary into consumer — independent cell, no donor aliasing.
+        ckpt.load_tgt(ctx_tgt, other.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+        // (4) Repeat for draft context if present.
+        if (ctx_dft) {
+            common_context_seq_rm(ctx_dft, other.id, -1, -1);
+            if (!common_context_seq_cp_attn_only(ctx_dft, id, other.id, 0, pos_end)) {
+                // Inconsistent: tgt succeeded but dft failed. Clean up and bail.
+                common_context_seq_rm(ctx_tgt, other.id, -1, -1);
+                return false;
+            }
+            ckpt.load_dft(ctx_dft, other.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
+
+        return true;
+    }
 };
 
 // [TAG_SHARED_PREFIX] whether `other` can lend prefix cells to `self`: a different slot that
@@ -2488,13 +2522,16 @@ private:
                     n_keep += 1;
                 }
 
-                // [TAG_SHARED_PREFIX_SHIFT] in a unified cache a prefix shared across slots (M1) lives
+                // [TAG_SHARED_PREFIX_SHIFT] in a unified cache a prefix shared across slots (M1/M2) lives
                 // in one set of cells carrying several seq ids. The in-place seq_add below would move
                 // those cells under every slot that shares them. Keep any prefix this slot has in common
                 // with another resident slot so the shift only touches this slot's private suffix - a
                 // shared token-prefix is a safe upper bound on the shared-cell region, re-derived each
                 // shift so it stays correct across slot reuse. Refuse if the shared prefix itself leaves
                 // no room to discard (same outcome as a parent/child shared prompt above).
+                // NOTE (M2): for hybrid caches the guard also protects the shared attention cells;
+                // each slot owns its own independent recurrent cell (restored from a checkpoint snapshot,
+                // never aliased), so the recurrent half does not need a separate guard here.
                 if (params_base.kv_unified && !slot.prompt.tokens.has_mtmd) {
                     // Exact co-owned length (set when a share fired), not a token-prefix guess: two slots
                     // that independently prefilled the same prompt share NO cells and shift normally.
@@ -2805,6 +2842,19 @@ private:
                                     !llama_model_is_hybrid(model_tgt)    &&
                                     !input_tokens.has_mtmd;
 
+                                // [TAG_SHARED_PREFIX] M2: hybrid (e.g. qwen35moe) prefix share.
+                                // Mutually exclusive with shared_prefix_ok (which excludes hybrid).
+                                // Requires kv_unified (one cell pool), n_swa==0 (no windowed attn),
+                                // is_hybrid (not pure recurrent), and checkpoints enabled so donor
+                                // recurrent state snapshots exist to restore from.
+                                const bool hybrid_prefix_ok =
+                                    params_base.kv_unified               &&
+                                    n_swa == 0                           &&
+                                    !llama_model_is_recurrent(model_tgt) &&
+                                    llama_model_is_hybrid(model_tgt)     &&
+                                    !input_tokens.has_mtmd               &&
+                                    params_base.n_ctx_checkpoints > 0;
+
                                 if (shared_prefix_ok) {
                                     server_slot * src = nullptr;
                                     size_t best = n_past; // only worth it if it beats the slot's own reuse
@@ -2831,6 +2881,69 @@ private:
                                         slot.prompt.tokens.keep_first(best);
                                         n_past = best;
                                         SLT_INF(slot, "[shared-prefix] reused %zu tokens from slot %d (zero-copy)\n", best, src->id);
+                                    }
+                                } else if (hybrid_prefix_ok) {
+                                    // [TAG_SHARED_PREFIX] M2: hybrid prefix share.
+                                    // (1) Find the donor slot (longest common prefix among GENERATING slots).
+                                    server_slot * src = nullptr;
+                                    size_t best = n_past; // only worth it if it beats the slot's own reuse
+                                    for (auto & other : slots) {
+                                        if (!is_prefix_share_candidate(slot, other)) continue;
+                                        if (other.state != SLOT_STATE_GENERATING) continue;
+                                        const size_t lcp = other.prompt.tokens.get_common_prefix(input_tokens);
+                                        if (lcp > best && lcp < input_tokens.size()) {
+                                            best = lcp;
+                                            src  = &other;
+                                        }
+                                    }
+
+                                    if (src != nullptr) {
+                                        // (2) Compute LCP position (non-mtmd: pos == token index).
+                                        const llama_pos pos_lcp = (llama_pos) best;
+
+                                        // (3) Find the latest donor checkpoint with pos_max <= pos_lcp.
+                                        const common_prompt_checkpoint * best_ckpt = nullptr;
+                                        for (auto it = src->prompt.checkpoints.rbegin();
+                                             it != src->prompt.checkpoints.rend(); ++it) {
+                                            if (it->pos_max <= pos_lcp) {
+                                                best_ckpt = &(*it);
+                                                break;
+                                            }
+                                        }
+
+                                        if (best_ckpt != nullptr) {
+                                            // (4) Align share boundary to checkpoint, mirroring in-tree
+                                            //     restore formula (server-context.cpp:2974-2975).
+                                            const llama_pos pos_next    = std::max(best_ckpt->pos_min + 1, best_ckpt->pos_max);
+                                            const size_t    best_aligned = std::min(
+                                                input_tokens.size_up_to_pos(pos_next),
+                                                (size_t) best_ckpt->n_tokens);
+                                            const llama_pos pos_end = pos_next;
+
+                                            // Safety: assert pos/token alignment is sane for non-mtmd.
+                                            GGML_ASSERT(input_tokens.size_up_to_pos(pos_end) == best_aligned);
+
+                                            if (best_aligned > (size_t) n_past) {
+                                                // (5) Attempt the hybrid share: attn zero-copy + recurrent restore.
+                                                if (src->share_hybrid_prefix_to(slot, pos_end, *best_ckpt)) {
+                                                    slot.prompt.tokens = input_tokens.clone();
+                                                    slot.prompt.tokens.keep_first(best_aligned);
+                                                    n_past = (int) best_aligned;
+                                                    SLT_INF(slot, "[shared-prefix:hybrid] reused %zu tokens from slot %d "
+                                                            "(attn zero-copy + recurrent restore @ pos %d)\n",
+                                                            best_aligned, src->id, pos_end);
+                                                } else {
+                                                    // Cast failed or dft inconsistency: consumer was seq_rm'd inside
+                                                    // share_hybrid_prefix_to; ensure it is fully clean for cold prefill.
+                                                    common_context_seq_rm(ctx_tgt, slot.id, -1, -1);
+                                                    if (ctx_dft) {
+                                                        common_context_seq_rm(ctx_dft.get(), slot.id, -1, -1);
+                                                    }
+                                                    SLT_WRN(slot, "%s", "[shared-prefix:hybrid] attn-only copy failed (not a plain hybrid?), falling back to cold prefill\n");
+                                                }
+                                            }
+                                        }
+                                        // If no qualifying checkpoint found: fall through to cold prefill silently.
                                     }
                                 }
 

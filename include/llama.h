@@ -730,6 +730,16 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // Hybrid-only: ranged seq_cp on the attention (unified KV) sub-cache ONLY, never the recurrent
+    // sub-cache. Returns true if performed (mem is a plain hybrid), false otherwise.
+    // On a dense unified cache use llama_memory_seq_cp instead.
+    LLAMA_API bool llama_memory_seq_cp_attn_only(
+            llama_memory_t mem,
+              llama_seq_id seq_id_src,
+              llama_seq_id seq_id_dst,
+                 llama_pos p0,
+                 llama_pos p1);
+
     // Removes all tokens that do not belong to the specified sequence
     LLAMA_API void llama_memory_seq_keep(
             llama_memory_t mem,
