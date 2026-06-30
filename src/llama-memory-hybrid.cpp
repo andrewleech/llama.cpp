@@ -154,6 +154,14 @@ void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
+bool llama_memory_hybrid::seq_cp_attn_only(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    // Share only the attention KV cells. The recurrent sub-cache is deliberately NOT copied: its
+    // seq_cp aliases the donor's live tail and ignores [p0,p1), so its state must be restored
+    // separately (from a checkpoint captured at the share boundary).
+    mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    return true;
+}
+
 void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
     mem_attn->seq_keep(seq_id);
     mem_recr->seq_keep(seq_id);

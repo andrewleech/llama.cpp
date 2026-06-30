@@ -911,9 +911,7 @@ void common_context_seq_rm (llama_context * ctx, llama_seq_id seq_id, llama_pos 
 void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta);
 void common_context_seq_cp (llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
 
-// Hybrid-only: ranged seq_cp on the attention (unified KV) sub-cache ONLY, never the recurrent
-// sub-cache. Returns true if performed (ctx has a plain hybrid memory), false otherwise.
-// Keeps the server at the common_* layer with no internal src/ includes.
+// Attention-only ranged seq_cp (see llama_memory_seq_cp_attn_only): returns true if performed.
 bool common_context_seq_cp_attn_only(llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
 
 //
@@ -1067,6 +1065,10 @@ struct common_prompt_checkpoint {
 
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
+
+    // First position to (re)process after restoring this checkpoint. >= 1 token must always be
+    // processed, so this is never below pos_min + 1 ([TAG_PROMPT_LOGITS]).
+    llama_pos aligned_pos() const { return std::max(pos_min + 1, pos_max); }
 
     size_t size() const;
 
