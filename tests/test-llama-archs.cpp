@@ -422,6 +422,153 @@ static bool arch_supported(const llm_arch arch) {
     return true;
 }
 
+// Build a model+context with kv_unified=true and n_seq_max=2, populated with a short
+// decode of `n_tokens` random tokens on seq 0.  Caller owns both returned objects.
+static std::pair<llama_model_ptr, llama_context_ptr> make_ctx_for_api_test(
+        const llm_arch arch, const bool moe, const size_t seed, const uint32_t n_tokens) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    // null-terminate devices list (CPU only)
+    std::vector<ggml_backend_dev_t> devs = { nullptr };
+    model_params.devices = devs.data();
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx         = 128;
+    ctx_params.n_ubatch      = 64;
+    ctx_params.n_threads     = 2;
+    ctx_params.n_threads_batch = 2;
+    ctx_params.n_seq_max     = 2;
+    ctx_params.kv_unified    = true;
+
+    size_t tmp = seed;
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tmp, model_params));
+    if (!model) {
+        throw std::runtime_error("make_ctx_for_api_test: failed to create model");
+    }
+    llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
+    if (!lctx) {
+        throw std::runtime_error("make_ctx_for_api_test: failed to create context");
+    }
+
+    // Populate seq 0 with n_tokens so the memory has something to copy.
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    const std::vector<llama_token> tokens = get_tokens(n_tokens, n_vocab, seed);
+    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+    for (uint32_t pos = 0; pos < n_tokens; pos++) {
+        common_batch_add(batch, tokens[pos], pos, {0}, true);
+    }
+    batch.n_tokens = n_tokens;
+    int rc = llama_decode(lctx.get(), batch);
+    llama_batch_free(batch);
+    if (rc != 0) {
+        throw std::runtime_error("make_ctx_for_api_test: llama_decode failed");
+    }
+
+    return std::make_pair(std::move(model), std::move(lctx));
+}
+
+// API-CONTRACT-DENSE-FALSE
+// On a dense (LLAMA) context, llama_memory_seq_cp_attn_only must return false.
+static int test_api_contract_dense_false(const size_t seed) {
+    printf("test_api_contract_dense_false: ");
+    fflush(stdout);
+
+    auto [model, lctx] = make_ctx_for_api_test(LLM_ARCH_LLAMA, /*moe=*/false, seed, /*n_tokens=*/8);
+    llama_memory_t mem = llama_get_memory(lctx.get());
+
+    // seq 0 has 8 tokens (positions 0..7); try to copy attn-only to seq 1
+    const bool result = llama_memory_seq_cp_attn_only(mem, /*src=*/0, /*dst=*/1, /*p0=*/0, /*p1=*/8);
+    if (result) {
+        fprintf(stderr, "FAIL — expected false on dense KV, got true\n");
+        return 1;
+    }
+    printf("OK\n");
+    return 0;
+}
+
+// API-CONTRACT-HYBRID-TRUE
+// On a hybrid (FALCON_H1) context, llama_memory_seq_cp_attn_only must return true and
+// must NOT copy the recurrent sub-state.  The observable contract:
+//   - After an attn-only copy to seq 1, seq_pos_max(1) == -1 because the hybrid
+//     implementation returns min(attn_pos_max, recr_pos_max); with only attention
+//     cells copied the recurrent side is still empty (pos_max -1) so the min is -1.
+//   - After a full llama_memory_seq_cp to seq 1, BOTH sides are populated and
+//     seq_pos_max(1) == p1-1 > -1.  This contrast confirms the two calls differ.
+// The source seq 0 must be unchanged by either operation.
+static int test_api_contract_hybrid_true(const size_t seed) {
+    printf("test_api_contract_hybrid_true: ");
+    fflush(stdout);
+
+    // FALCON_H1 is hybrid SSM+attention and not MoE mandatory, so moe=false works.
+
+    // --- Part A: attn-only copy leaves recurrent side empty ---
+    {
+        auto [model, lctx] = make_ctx_for_api_test(LLM_ARCH_FALCON_H1, /*moe=*/false, seed, /*n_tokens=*/8);
+        llama_memory_t mem = llama_get_memory(lctx.get());
+
+        // Verify seq 0 has data after decode.
+        const llama_pos pos_max_src_before = llama_memory_seq_pos_max(mem, 0);
+        if (pos_max_src_before < 0) {
+            fprintf(stderr, "FAIL — seq 0 has no data after decode (pos_max=%d)\n", (int)pos_max_src_before);
+            return 1;
+        }
+
+        // seq 1 must be empty before the copy.
+        if (llama_memory_seq_pos_max(mem, 1) >= 0) {
+            fprintf(stderr, "FAIL — seq 1 not empty before attn-only copy\n");
+            return 1;
+        }
+
+        // llama_memory_seq_cp_attn_only must return true for a hybrid memory.
+        const llama_pos p0 = 0, p1 = 8;
+        const bool result = llama_memory_seq_cp_attn_only(mem, /*src=*/0, /*dst=*/1, p0, p1);
+        if (!result) {
+            fprintf(stderr, "FAIL — expected true on hybrid (FALCON_H1) memory, got false\n");
+            return 1;
+        }
+
+        // The hybrid seq_pos_max is min(attn_pos_max, recr_pos_max).  Since only the
+        // attention cells were copied, the recurrent side remains at -1, so the hybrid
+        // seq_pos_max(1) must still be -1 — confirming the recurrent tail was NOT copied.
+        const llama_pos pos_max_dst_attn_only = llama_memory_seq_pos_max(mem, 1);
+        if (pos_max_dst_attn_only != -1) {
+            fprintf(stderr, "FAIL — seq 1 pos_max after attn-only copy: expected -1 (recurrent not copied), got %d\n",
+                    (int)pos_max_dst_attn_only);
+            return 1;
+        }
+
+        // Source must be unchanged.
+        const llama_pos pos_max_src_after = llama_memory_seq_pos_max(mem, 0);
+        if (pos_max_src_after != pos_max_src_before) {
+            fprintf(stderr, "FAIL — src seq 0 pos_max changed: was %d, now %d\n",
+                    (int)pos_max_src_before, (int)pos_max_src_after);
+            return 1;
+        }
+    }
+
+    // --- Part B: contrast — a full seq_cp populates both sides (pos_max > -1) ---
+    {
+        auto [model, lctx] = make_ctx_for_api_test(LLM_ARCH_FALCON_H1, /*moe=*/false, seed, /*n_tokens=*/8);
+        llama_memory_t mem = llama_get_memory(lctx.get());
+
+        const llama_pos p0 = 0, p1 = 8;
+        llama_memory_seq_cp(mem, /*src=*/0, /*dst=*/1, p0, p1);
+
+        // After a full copy both attn and recurrent are populated; min > -1.
+        const llama_pos pos_max_full = llama_memory_seq_pos_max(mem, 1);
+        if (pos_max_full < 0) {
+            fprintf(stderr, "FAIL — seq 1 pos_max after full seq_cp expected >=0, got %d\n",
+                    (int)pos_max_full);
+            return 1;
+        }
+    }
+
+    printf("OK\n");
+    return 0;
+}
+
 static int save_models(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level, const std::string & dir) {
     struct user_data_t {
         struct {
@@ -690,6 +837,17 @@ int main(int argc, char ** argv) {
     try {
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
+        }
+        // API-CONTRACT tests are arch-independent (each builds its own LLAMA + FALCON_H1 contexts),
+        // so run them once - on the aggregate (no -a) run or the LLAMA arch - rather than per-arch,
+        // which would rebuild the FALCON_H1 fixtures on every arch in a full sweep.
+        if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_LLAMA) {
+            int rc = 0;
+            rc |= test_api_contract_dense_false(seed);
+            rc |= test_api_contract_hybrid_true(seed);
+            if (rc != 0) {
+                return rc;
+            }
         }
         return test_backends(arch, seed, log_level);
     } catch (const std::exception & err) {
