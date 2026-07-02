@@ -77,6 +77,8 @@ class ServerProcess:
     n_slots: int | None = None
     ctk: str | None = None
     ctv: str | None = None
+    n_ctx_checkpoints: int | None = None
+    checkpoint_min_step: int | None = None
     fa: str | None = None
     server_continuous_batching: bool | None = False
     server_embeddings: bool | None = False
@@ -202,6 +204,10 @@ class ServerProcess:
             server_args.extend(["-ctk", self.ctk])
         if self.ctv:
             server_args.extend(["-ctv", self.ctv])
+        if self.n_ctx_checkpoints is not None:
+            server_args.extend(["--ctx-checkpoints", self.n_ctx_checkpoints])
+        if self.checkpoint_min_step is not None:
+            server_args.extend(["--checkpoint-min-step", self.checkpoint_min_step])
         if self.fa is not None:
             server_args.extend(["-fa", self.fa])
         if self.n_predict:
@@ -476,13 +482,18 @@ server_instances: Set[ServerProcess] = set()
 
 
 class ServerPreset:
+    # Presets that load_all() must NOT pre-download: the falcon_h1 hybrid model is only
+    # needed by the @pytest.mark.slow M2 tests, which fetch it on demand. Keeping it out
+    # of load_all() ensures a fast-lane run (-m "not slow") never downloads it.
+    _LOAD_ALL_SKIP = {"load_all", "falcon_h1_tiny"}
+
     @staticmethod
     def load_all() -> None:
         """ Load all server presets to ensure model files are cached. """
         servers: List[ServerProcess] = [
             method()
             for name, method in ServerPreset.__dict__.items()
-            if callable(method) and name != "load_all"
+            if callable(method) and name not in ServerPreset._LOAD_ALL_SKIP
         ]
         for server in servers:
             server.offline = False
@@ -590,6 +601,22 @@ class ServerPreset:
         server.n_batch = 32
         server.n_slots = 2
         server.n_predict = 4
+        server.seed = 42
+        return server
+
+    @staticmethod
+    def falcon_h1_tiny() -> ServerProcess:
+        # Hybrid SSM+attention model (~55 MB) used only by the slow-lane M2 shared-prefix
+        # tests. Deliberately excluded from load_all() (see _LOAD_ALL_SKIP) so the fast lane
+        # never downloads it; the slow fixtures set offline=False on first use to fetch it.
+        server = ServerProcess()
+        server.model_hf_repo = "tiiuae/Falcon-H1-Tiny-90M-Instruct-GGUF"
+        server.model_hf_file = "Falcon-H1-Tiny-90M-Instruct-Q4_0.gguf"
+        server.model_alias = "falcon-h1-tiny"
+        server.n_ctx = 1024
+        server.n_batch = 64
+        server.n_slots = 2
+        server.n_predict = 16
         server.seed = 42
         return server
 

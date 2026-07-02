@@ -730,6 +730,19 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // Copy ONLY the attention KV cells of [p0, p1), never a recurrent sub-state (which cannot be
+    // position-shared). Returns true if the memory has a distinct attention sub-cache to copy in
+    // isolation (a hybrid SSM+attention cache). Returns false on a plain KV cache (or null memory),
+    // where "attention only" is not a distinct operation: the caller must decide whether full
+    // llama_memory_seq_cp semantics are acceptable and fall back to it. Intended for sharing the
+    // attention prefix of a hybrid cache while its recurrent state is restored separately.
+    LLAMA_API bool llama_memory_seq_cp_attn_only(
+            llama_memory_t mem,
+              llama_seq_id seq_id_src,
+              llama_seq_id seq_id_dst,
+                 llama_pos p0,
+                 llama_pos p1);
+
     // Removes all tokens that do not belong to the specified sequence
     LLAMA_API void llama_memory_seq_keep(
             llama_memory_t mem,
