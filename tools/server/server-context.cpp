@@ -119,6 +119,12 @@ struct server_slot {
     bool has_new_line   = false;
     bool truncated      = false;
 
+    // [TAG_SHARED_PREFIX] length of the prompt prefix this slot co-owns with another slot via a fired
+    // cross-slot share (seq_cp). Set when a share attaches; the context-shift guard keeps at least this
+    // many tokens so an in-place seq_add never moves cells another slot still references. 0 = no shared
+    // cells (two slots that independently prefilled the same prompt do NOT set this - they share nothing).
+    size_t shared_prefix_n = 0;
+
     stop_type stop;
 
     std::string stopping_word;
@@ -178,6 +184,7 @@ struct server_slot {
         }
 
         prompt.tokens.clear();
+        shared_prefix_n = 0; // cells are gone, so this slot no longer co-owns any shared prefix
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -578,7 +585,35 @@ struct server_slot {
         other.prompt = prompt.clone();
         other.init_sampler();
     }
+
+    // [TAG_SHARED_PREFIX] share this slot's prefix KV [0, n) into `other` (target + draft).
+    // On a unified cache this is metadata-only: the cells gain `other`'s seq id at the same
+    // positions, so a fan-out of slots sharing one prefix prefills it once, not once each.
+    void share_prefix_to(server_slot & other, llama_pos n) {
+        common_context_seq_rm(ctx_tgt, other.id,     -1, -1);
+        common_context_seq_cp(ctx_tgt, id, other.id, 0, n);
+
+        if (ctx_dft) {
+            common_context_seq_rm(ctx_dft, other.id,     -1, -1);
+            common_context_seq_cp(ctx_dft, id, other.id, 0, n);
+        }
+
+        // Record the co-ownership on BOTH slots so each one's context-shift guard keeps [0,n).
+        other.shared_prefix_n = (size_t) n;
+        shared_prefix_n       = std::max(shared_prefix_n, (size_t) n);
+    }
 };
+
+// [TAG_SHARED_PREFIX] whether `other` can lend prefix cells to `self`: a different slot that
+// currently holds plain-text prompt cells. Shared by the attach search and the context-shift
+// guard so their candidate sets cannot drift apart.
+static bool is_prefix_share_candidate(const server_slot & self, const server_slot & other) {
+    return other.id != self.id
+        && other.prompt.tokens.size() != 0
+        && !other.prompt.tokens.has_mtmd
+        // KV computed under a different LoRA adapter set is invalid to share (same predicate batching uses).
+        && are_lora_equal(self.lora, other.lora);
+}
 
 
 
@@ -1010,6 +1045,15 @@ private:
                 params_base.n_cache_reuse = 0;
                 SRV_WRN("%s\n", "cache_reuse is not supported by this context, it will be disabled");
             }
+        }
+
+        // Cross-slot shared-prefix reuse (M1/M2) refcounts KV cells across slots on a unified cache.
+        // The cache-reuse compaction does an in-place seq_add that would move cells still co-owned by
+        // another slot and corrupt its KV. The two are mutually exclusive, so prefer the cross-slot
+        // share and disable cache-reuse whenever the cache is unified.
+        if (params_base.kv_unified && params_base.n_cache_reuse) {
+            params_base.n_cache_reuse = 0;
+            SRV_WRN("%s\n", "cache_reuse is disabled with a unified KV cache (cross-slot shared-prefix reuse is used instead)");
         }
 
         if (llama_model_n_swa(model_tgt) == 0) {
@@ -2444,6 +2488,25 @@ private:
                     n_keep += 1;
                 }
 
+                // [TAG_SHARED_PREFIX_SHIFT] in a unified cache a prefix shared across slots (M1) lives
+                // in one set of cells carrying several seq ids. The in-place seq_add below would move
+                // those cells under every slot that shares them. Keep any prefix this slot has in common
+                // with another resident slot so the shift only touches this slot's private suffix - a
+                // shared token-prefix is a safe upper bound on the shared-cell region, re-derived each
+                // shift so it stays correct across slot reuse. Refuse if the shared prefix itself leaves
+                // no room to discard (same outcome as a parent/child shared prompt above).
+                if (params_base.kv_unified && !slot.prompt.tokens.has_mtmd) {
+                    // Exact co-owned length (set when a share fired), not a token-prefix guess: two slots
+                    // that independently prefilled the same prompt share NO cells and shift normally.
+                    const int n_shared = (int) slot.shared_prefix_n;
+                    if (n_shared > slot.n_ctx - 4) {
+                        send_error(slot, "context shift cannot be used: shared prefix fills the context", ERROR_TYPE_SERVER);
+                        slot.release();
+                        continue;
+                    }
+                    n_keep = std::max(n_keep, n_shared);
+                }
+
                 n_keep = std::min(slot.n_ctx - 4, n_keep);
 
                 const int n_left    = slot.prompt.n_tokens() - n_keep;
@@ -2720,6 +2783,56 @@ private:
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+
+                                // [TAG_SHARED_PREFIX] cross-slot zero-copy shared prefix (M1): if another
+                                // generating slot shares a longer prefix with this prompt than the slot's
+                                // own cache, attach those KV cells (see share_prefix_to) instead of
+                                // recomputing. See dev-notes/shared-prefix-design.md.
+                                //
+                                // Only valid on a plain unified KV cache:
+                                //  - kv_unified: one shared cell pool, so the share is metadata-only. Without
+                                //    it each slot owns a separate stream and the cross-stream seq_cp hits
+                                //    GGML_ASSERT(is_full) and aborts the server on an ordinary request.
+                                //  - non-SWA / non-recurrent / non-hybrid: those caches keep only a trailing
+                                //    window or a rolled-up state per sequence, so sharing a [0,best) range
+                                //    would not reproduce full-prefix attention. Fall through to a normal
+                                //    prefill rather than risk silent corruption. (n_swa honors swa_full.)
+                                const llama_model * model_tgt = llama_get_model(ctx_tgt);
+                                const bool shared_prefix_ok =
+                                    params_base.kv_unified              &&
+                                    n_swa == 0                          &&
+                                    !llama_model_is_recurrent(model_tgt) &&
+                                    !llama_model_is_hybrid(model_tgt)    &&
+                                    !input_tokens.has_mtmd;
+
+                                if (shared_prefix_ok) {
+                                    server_slot * src = nullptr;
+                                    size_t best = n_past; // only worth it if it beats the slot's own reuse
+                                    for (auto & other : slots) {
+                                        if (!is_prefix_share_candidate(slot, other)) continue;
+                                        // only share from a generating slot: its prompt cells are fully
+                                        // computed and stable. A slot still processing its own prompt has
+                                        // not-yet-computed suffix cells that would corrupt output.
+                                        if (other.state != SLOT_STATE_GENERATING) continue;
+                                        const size_t lcp = other.prompt.tokens.get_common_prefix(input_tokens);
+                                        if (lcp > best && lcp < input_tokens.size()) {
+                                            best = lcp;
+                                            src  = &other;
+                                        }
+                                    }
+
+                                    if (src != nullptr) {
+                                        // share [0,best); the cells now carry both seq ids and survive until
+                                        // the last consumer releases. The context-shift guard
+                                        // ([TAG_SHARED_PREFIX_SHIFT]) keeps these positions from moving in
+                                        // place under the source slot.
+                                        src->share_prefix_to(slot, (llama_pos) best);
+                                        slot.prompt.tokens = input_tokens.clone();
+                                        slot.prompt.tokens.keep_first(best);
+                                        n_past = best;
+                                        SLT_INF(slot, "[shared-prefix] reused %zu tokens from slot %d (zero-copy)\n", best, src->id);
+                                    }
+                                }
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
